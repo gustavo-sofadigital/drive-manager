@@ -749,7 +749,38 @@ function cancelDownload(iid) {
   if (!dlList.children.length) document.getElementById('dlPanel').classList.remove('show');
 }
 
-function downloadSelected(){[...S.selected].forEach(id=>{const f=S.files.find(x=>x.id===id);if(f&&!f.isFolder&&!f.isDrive)downloadFile(f.id,f.name,f.sizeBytes,f.mimeType);});}
+async function downloadSelected() {
+  const selected = [...S.selected]
+    .map(id => S.files.find(x => x.id === id))
+    .filter(f => f && !f.isFolder && !f.isDrive);
+
+  if (!selected.length) return;
+
+  // 1 arquivo — usa showSaveFilePicker normalmente
+  if (selected.length === 1) {
+    const f = selected[0];
+    downloadFile(f.id, f.name, f.sizeBytes, f.mimeType);
+    return;
+  }
+
+  // Múltiplos arquivos — showDirectoryPicker uma vez, salva todos na pasta escolhida
+  let destDir;
+  try {
+    destDir = await window.showDirectoryPicker({ mode: 'readwrite' });
+  } catch(e) {
+    if (e.name !== 'AbortError') toast('Erro ao abrir seletor: ' + e.message, 'er');
+    return;
+  }
+
+  toast(selected.length + ' arquivo(s) — iniciando downloads', 'in');
+  for (const f of selected) {
+    // Monta objeto compatível com downloadFileToDir
+    await downloadFileToDir(
+      { id: f.id, name: f.name, path: f.name, sizeBytes: f.sizeBytes, mimeType: f.mimeType },
+      destDir
+    );
+  }
+}
 
 // ════════════════════════════════════════════════════════════
 // DOWNLOAD DE PASTA
