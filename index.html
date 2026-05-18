@@ -403,13 +403,20 @@ async function startAuth() {
     code_challenge_method: 'S256',
     access_type:           'offline',
     prompt:                'consent',
+    state:                 verifier,
   });
   location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + params;
 }
 
 async function handleCallback(code) {
-  const verifier = localStorage.getItem('pkce_verifier');
+  // Tenta localStorage primeiro, depois state da URL como fallback
+  const urlParams = new URLSearchParams(location.search);
+  const stateVerifier = urlParams.get('state');
+  const storedVerifier = localStorage.getItem('pkce_verifier');
+  const verifier = storedVerifier || stateVerifier;
   localStorage.removeItem('pkce_verifier');
+  console.log('verifier source:', storedVerifier ? 'localStorage' : 'state');
+  console.log('verifier:', verifier ? verifier.slice(0,10)+'...' : 'NULL');
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
