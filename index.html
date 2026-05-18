@@ -754,36 +754,181 @@ function downloadSelected(){[...S.selected].forEach(id=>{const f=S.files.find(x=
 // ════════════════════════════════════════════════════════════
 // DOWNLOAD DE PASTA
 // ════════════════════════════════════════════════════════════
-async function downloadFolder(folderId,folderName) {
-  toast('Listando "'+folderName+'"...','in');
-  showLoad('Listando arquivos...');
+async function downloadFolder(folderId, folderName) {
+  // 1. Usuário escolhe a pasta de destino UMA vez
+  let destDir;
   try {
-    const files=await listFolderRecursive(folderId,folderName);
+    destDir = await window.showDirectoryPicker({ mode: 'readwrite' });
+  } catch(e) {
+    if (e.name !== 'AbortError') toast('Erro ao abrir seletor: ' + e.message, 'er');
+    return;
+  }
+
+  // 2. Lista todos os arquivos recursivamente
+  toast('Listando "' + folderName + '"...', 'in');
+  showLoad('Listando arquivos...');
+  let files;
+  try {
+    files = await listFolderRecursive(folderId, '');
     hideLoad();
-    if (!files.length){toast('Pasta vazia','in');return;}
-    toast(files.length+' arquivo(s) — iniciando downloads','in');
-    for (const f of files) downloadFile(f.id,f.path,f.sizeBytes,f.mimeType);
-  } catch(e){hideLoad();toast('Erro: '+e.message,'er');}
+  } catch(e) {
+    hideLoad(); toast('Erro ao listar: ' + e.message, 'er'); return;
+  }
+
+  if (!files.length) { toast('Pasta vazia', 'in'); return; }
+  toast(files.length + ' arquivo(s) encontrado(s) — iniciando downloads', 'in');
+
+  // 3. Cria pasta raiz dentro do destino escolhido
+  const rootDir = await destDir.getDirectoryHandle(folderName, { create: true });
+
+  // 4. Baixa cada arquivo streaming direto pro disco mantendo estrutura
+  for (const f of files) {
+    await downloadFileToDir(f, rootDir);
+  }
 }
 
-async function listFolderRecursive(folderId,basePath) {
-  const results=[];
+// Baixa um arquivo e salva dentro de um FileSystemDirectoryHandle
+async function downloadFileToDir(f, rootDir) {
+  const dlList  = document.getElementById('dlList');
+  const dlPanel = document.getElementById('dlPanel');
+  const iid     = 'dl-' + f.id + '-' + Date.now();
+  const dlCtrl  = new AbortController();
+  S.dlControllers.set(iid, dlCtrl);
+
+  // Nome exibido no painel = caminho relativo (ex: Episodios/EP01.mov)
+  const displayName = f.path || f.name;
+
+  dlList.insertAdjacentHTML('beforeend', `
+    <div class="dl-item" id="${iid}">
+      <span class="dl-name">${displayName}</span>
+      <div class="dl-bar-wrap"><div class="dl-bar" id="${iid}-bar" style="width:0%"></div></div>
+      <span class="dl-pct" id="${iid}-pct">0%</span>
+      <span class="dl-spd" id="${iid}-spd">—</span>
+      <button class="dl-cancel" onclick="cancelDownload('${iid}')" title="Cancelar">✕</button>
+    </div>`);
+  dlPanel.classList.add('show');
+
+  try {
+    await ensureToken();
+
+    // Monta URL de download
+    const isGA = f.mimeType && f.mimeType.startsWith('application/vnd.google-apps.');
+    let url, fileName = f.path.split('/').pop();
+    if (isGA) {
+      const em = exportMime(f.mimeType);
+      const exts = {
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+      };
+      fileName += exts[em] || '';
+      url = `${API}/files/${f.id}/export?mimeType=${encodeURIComponent(em)}&supportsAllDrives=true`;
+    } else {
+      url = `${API}/files/${f.id}?alt=media&supportsAllDrives=true`;
+    }
+
+    // Navega/cria subpastas preservando estrutura
+    // f.path = "subpasta/arquivo.mov" → cria subpasta dentro de rootDir
+    const pathParts = f.path.split('/');
+    let currentDir  = rootDir;
+    for (let i = 0; i < pathParts.length - 1; i++) {
+      currentDir = await currentDir.getDirectoryHandle(pathParts[i], { create: true });
+    }
+
+    // Cria o arquivo no disco
+    const fileHandle = await currentDir.getFileHandle(fileName, { create: true });
+    const writable   = await fileHandle.createWritable();
+
+    // Stream fetch → disco
+    const res = await fetch(url, { headers: { Authorization: 'Bearer ' + S.token }, signal: dlCtrl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const cl     = parseInt(res.headers.get('Content-Length') || f.sizeBytes || 0);
+    const reader = res.body.getReader();
+    let recv = 0, lastRecv = 0, lastTs = Date.now();
+
+    const speedTimer = setInterval(() => {
+      const now = Date.now(), elapsed = (now - lastTs) / 1000;
+      if (elapsed > 0) {
+        const spd = document.getElementById(iid + '-spd');
+        if (spd) spd.textContent = fmtBytes((recv - lastRecv) / elapsed) + '/s';
+        lastRecv = recv; lastTs = now;
+      }
+    }, 1000);
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read(); if (done) break;
+        await writable.write(value);
+        recv += value.length;
+        const pct = cl ? Math.round(recv / cl * 100) : 0;
+        const bar  = document.getElementById(iid + '-bar');
+        const pctEl = document.getElementById(iid + '-pct');
+        if (bar)   bar.style.width  = pct + '%';
+        if (pctEl) pctEl.textContent = pct + '%';
+      }
+      await writable.close();
+    } catch(e) {
+      clearInterval(speedTimer);
+      try { await writable.abort(); } catch(_) {}
+      throw e;
+    }
+
+    clearInterval(speedTimer);
+    S.dlControllers.delete(iid);
+    const bar   = document.getElementById(iid + '-bar');
+    const pctEl = document.getElementById(iid + '-pct');
+    if (bar)   { bar.style.width = '100%'; bar.style.background = 'var(--green)'; }
+    if (pctEl) pctEl.textContent = '✓';
+    logTransfer({ type: 'download', name: fileName, size: fmtBytes(recv), folder: S.currentFolderName, ts: Date.now(), user: S.userEmail, status: 'ok' });
+    setTimeout(() => {
+      document.getElementById(iid)?.remove();
+      if (!dlList.children.length) dlPanel.classList.remove('show');
+    }, 3000);
+
+  } catch(e) {
+    S.dlControllers.delete(iid);
+    if (e.name === 'AbortError') {
+      document.getElementById(iid)?.remove();
+      if (!dlList.children.length) dlPanel.classList.remove('show');
+      return;
+    }
+    const bar   = document.getElementById(iid + '-bar');
+    const pctEl = document.getElementById(iid + '-pct');
+    if (bar)   bar.style.background = 'var(--red)';
+    if (pctEl) pctEl.textContent = '!';
+    toast('Erro: ' + e.message, 'er');
+  }
+}
+
+async function listFolderRecursive(folderId, basePath) {
+  const results = [];
   await ensureToken();
-  const url=new URL(API+'/files');
-  url.searchParams.set('pageSize','200');
-  url.searchParams.set('fields','files(id,name,mimeType,size)');
-  url.searchParams.set('q',`'${folderId}' in parents and trashed=false`);
-  url.searchParams.set('orderBy','folder,name');
-  if (S.currentDrive){url.searchParams.set('corpora','drive');url.searchParams.set('driveId',S.currentDrive);url.searchParams.set('includeItemsFromAllDrives','true');url.searchParams.set('supportsAllDrives','true');}
-  const res=await fetch(url.toString(),{headers:{Authorization:'Bearer '+S.token}});
-  if (!res.ok) throw new Error('HTTP '+res.status);
-  const data=await res.json();
-  for (const f of (data.files||[])) {
-    if (f.mimeType==='application/vnd.google-apps.folder') {
-      const sub=await listFolderRecursive(f.id,basePath+'/'+f.name);
+  const url = new URL(API + '/files');
+  url.searchParams.set('pageSize', '200');
+  url.searchParams.set('fields', 'files(id,name,mimeType,size)');
+  url.searchParams.set('q', `'${folderId}' in parents and trashed=false`);
+  url.searchParams.set('orderBy', 'folder,name');
+  if (S.currentDrive) {
+    url.searchParams.set('corpora', 'drive');
+    url.searchParams.set('driveId', S.currentDrive);
+    url.searchParams.set('includeItemsFromAllDrives', 'true');
+    url.searchParams.set('supportsAllDrives', 'true');
+  }
+  const res  = await fetch(url.toString(), { headers: { Authorization: 'Bearer ' + S.token } });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  for (const f of (data.files || [])) {
+    if (f.mimeType === 'application/vnd.google-apps.folder') {
+      const sub = await listFolderRecursive(f.id, basePath ? basePath + '/' + f.name : f.name);
       results.push(...sub);
     } else {
-      results.push({id:f.id,path:basePath+'/'+f.name,sizeBytes:parseInt(f.size||0),mimeType:f.mimeType});
+      results.push({
+        id:        f.id,
+        name:      f.name,
+        path:      basePath ? basePath + '/' + f.name : f.name,
+        sizeBytes: parseInt(f.size || 0),
+        mimeType:  f.mimeType,
+      });
     }
   }
   return results;
