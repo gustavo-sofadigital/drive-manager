@@ -377,67 +377,31 @@ const S = {
 };
 
 // ════════════════════════════════════════════════════════════
-// OAUTH PKCE
+// OAUTH — fluxo implícito (token direto na URL hash)
+// Ideal para apps JavaScript puros sem backend
 // ════════════════════════════════════════════════════════════
-function base64url(buf) {
-  return btoa(String.fromCharCode(...new Uint8Array(buf)))
-    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
-}
-
-async function generatePKCE() {
-  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
-  const hashed   = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
-  const challenge = base64url(hashed);
-  return { verifier, challenge };
-}
-
-async function startAuth() {
-  const { verifier, challenge } = await generatePKCE();
-  localStorage.setItem('pkce_verifier', verifier);
+function startAuth() {
   const params = new URLSearchParams({
-    client_id:             CLIENT_ID,
-    redirect_uri:          REDIRECT,
-    response_type:         'code',
-    scope:                 SCOPES,
-    code_challenge:        challenge,
-    code_challenge_method: 'S256',
-    access_type:           'offline',
-    prompt:                'consent',
-    state:                 verifier,
+    client_id:     CLIENT_ID,
+    redirect_uri:  REDIRECT,
+    response_type: 'token',
+    scope:         SCOPES,
+    prompt:        'consent',
   });
   location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + params;
 }
 
-async function handleCallback(code) {
-  // Tenta localStorage primeiro, depois state da URL como fallback
-  const urlParams = new URLSearchParams(location.search);
-  const stateVerifier = urlParams.get('state');
-  const storedVerifier = localStorage.getItem('pkce_verifier');
-  const verifier = storedVerifier || stateVerifier;
-  localStorage.removeItem('pkce_verifier');
-  console.log('verifier source:', storedVerifier ? 'localStorage' : 'state');
-  console.log('verifier:', verifier ? verifier.slice(0,10)+'...' : 'NULL');
-  const tokenBody = new URLSearchParams({
-    client_id:     CLIENT_ID,
-    redirect_uri:  REDIRECT,
-    grant_type:    'authorization_code',
-    code,
-    code_verifier: verifier,
-  });
-  console.log('token request body:', Object.fromEntries(tokenBody));
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: tokenBody,
-  });
-  const data = await res.json();
-  console.log('token response:', JSON.stringify(data));
-  if (data.access_token) {
-    S.token = data.access_token;
-    S.tokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+function handleCallback() {
+  // Token retorna no hash da URL: #access_token=...&expires_in=...
+  const hash = new URLSearchParams(location.hash.slice(1));
+  const token = hash.get('access_token');
+  const expiresIn = parseInt(hash.get('expires_in') || '3600');
+  if (token) {
+    S.token = token;
+    S.tokenExpiry = Date.now() + expiresIn * 1000;
     localStorage.setItem(LS_TOKEN,  S.token);
     localStorage.setItem(LS_EXPIRY, S.tokenExpiry);
-    // Limpa code da URL
+    // Limpa hash da URL — token não fica exposto
     history.replaceState(null, '', REDIRECT);
     return true;
   }
@@ -512,11 +476,9 @@ window.onload = async () => {
   try { S.transferLog = JSON.parse(localStorage.getItem(LS_LOG)||'[]'); } catch(_) {}
   S.logSheetId = localStorage.getItem(LS_SHEET) || null;
 
-  // Verifica callback OAuth
-  const urlParams = new URLSearchParams(location.search);
-  const code = urlParams.get('code');
-  if (code) {
-    const ok = await handleCallback(code);
+  // Verifica callback OAuth — token vem no hash da URL
+  if (location.hash && location.hash.includes('access_token')) {
+    const ok = handleCallback();
     if (!ok) { toast('Erro no login', 'er'); return; }
   } else if (!loadSavedToken()) {
     return; // Mostra tela de auth
