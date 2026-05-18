@@ -393,7 +393,7 @@ async function generatePKCE() {
 
 async function startAuth() {
   const { verifier, challenge } = await generatePKCE();
-  sessionStorage.setItem('pkce_verifier', verifier);
+  localStorage.setItem('pkce_verifier', verifier);
   const params = new URLSearchParams({
     client_id:             CLIENT_ID,
     redirect_uri:          REDIRECT,
@@ -408,8 +408,8 @@ async function startAuth() {
 }
 
 async function handleCallback(code) {
-  const verifier = sessionStorage.getItem('pkce_verifier');
-  sessionStorage.removeItem('pkce_verifier');
+  const verifier = localStorage.getItem('pkce_verifier');
+  localStorage.removeItem('pkce_verifier');
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
