@@ -871,20 +871,23 @@ function cancelDownload(iid) {
 }
 
 async function downloadSelected() {
-  const selected = [...S.selected]
+  const all = [...S.selected]
     .map(id => S.files.find(x => x.id === id))
-    .filter(f => f && !f.isFolder && !f.isDrive);
+    .filter(Boolean);
 
-  if (!selected.length) return;
+  if (!all.length) return;
 
-  // 1 arquivo — usa showSaveFilePicker normalmente
-  if (selected.length === 1) {
-    const f = selected[0];
-    downloadFile(f.id, f.name, f.sizeBytes, f.mimeType);
+  const folders = all.filter(f => f.isFolder);
+  const files   = all.filter(f => !f.isFolder && !f.isDrive);
+
+  // Só 1 arquivo, sem pastas — showSaveFilePicker direto
+  if (files.length === 1 && folders.length === 0) {
+    downloadFile(files[0].id, files[0].name, files[0].sizeBytes, files[0].mimeType);
     return;
   }
 
-  // Múltiplos arquivos — showDirectoryPicker uma vez, salva todos na pasta escolhida
+  // Qualquer outro caso (pastas, múltiplos arquivos, mistura)
+  // showDirectoryPicker uma vez — tudo vai para a mesma pasta destino
   let destDir;
   try {
     destDir = await window.showDirectoryPicker({ mode: 'readwrite' });
@@ -893,13 +896,28 @@ async function downloadSelected() {
     return;
   }
 
-  toast(selected.length + ' arquivo(s) — iniciando downloads', 'in');
-  for (const f of selected) {
-    // Monta objeto compatível com downloadFileToDir
+  // Arquivos individuais — direto para a pasta destino
+  for (const f of files) {
     await downloadFileToDir(
       { id: f.id, name: f.name, path: f.name, sizeBytes: f.sizeBytes, mimeType: f.mimeType },
       destDir
     );
+  }
+
+  // Pastas — lista recursivamente e replica estrutura
+  for (const folder of folders) {
+    toast('Listando "' + folder.name + '"...', 'in');
+    try {
+      const folderFiles = await listFolderRecursive(folder.id, '');
+      if (!folderFiles.length) { toast('"' + folder.name + '" está vazia', 'in'); continue; }
+      // Cria subpasta com nome da pasta no destino
+      const subDir = await destDir.getDirectoryHandle(folder.name, { create: true });
+      for (const f of folderFiles) {
+        await downloadFileToDir(f, subDir);
+      }
+    } catch(e) {
+      toast('Erro em "' + folder.name + '": ' + e.message, 'er');
+    }
   }
 }
 
