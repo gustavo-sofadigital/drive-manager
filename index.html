@@ -489,59 +489,53 @@ function refreshToken() {
   document.getElementById('tokenDot').className = 'token-dot warn';
   document.getElementById('tokenLabel').textContent = 'renovando...';
 
-  // Renovação silenciosa via iframe oculto
-  // O Google retorna um novo token no src do iframe se o usuário ainda estiver logado
-  // prompt=none garante que não abre nenhuma janela visível
+  // Estratégia: abre popup minúsculo com prompt=none
+  // O popup redireciona de volta para o app com o novo token no hash
+  // A página principal escuta via BroadcastChannel
   const params = new URLSearchParams({
     client_id:     CLIENT_ID,
     redirect_uri:  REDIRECT,
     response_type: 'token',
     scope:         SCOPES,
-    prompt:        'none', // silencioso — falha se sessão expirou
+    prompt:        'none',
+    state:         'refresh', // identifica que é renovação
   });
 
-  // Remove iframe anterior se existir
-  const old = document.getElementById('oauth_refresh_frame');
-  if (old) old.remove();
+  // BroadcastChannel escuta o token que a página de retorno vai enviar
+  const ch = new BroadcastChannel('sdm_token_refresh');
+  let done = false;
 
-  const iframe = document.createElement('iframe');
-  iframe.id    = 'oauth_refresh_frame';
-  iframe.style.cssText = 'display:none;position:absolute;width:1px;height:1px';
-  iframe.src   = 'https://accounts.google.com/o/oauth2/v2/auth?' + params;
-  document.body.appendChild(iframe);
-
-  // Escuta o redirect do iframe — quando carrega a URL do app com o novo token
-  iframe.onload = () => {
-    try {
-      const hash = new URLSearchParams(iframe.contentWindow.location.hash.slice(1));
-      const token = hash.get('access_token');
-      const expiresIn = parseInt(hash.get('expires_in') || '3600');
-      if (token) {
-        S.token = token;
-        S.tokenExpiry = Date.now() + expiresIn * 1000;
-        localStorage.setItem(LS_TOKEN,  S.token);
-        localStorage.setItem(LS_EXPIRY, S.tokenExpiry);
-        scheduleTokenRefresh();
-        toast('Token renovado automaticamente', 'ok');
-      } else {
-        // Sessão Google expirou — precisa de login manual
-        handleTokenExpired();
-      }
-    } catch(e) {
-      // Cross-origin ou erro de acesso — sessão expirou
-      handleTokenExpired();
-    } finally {
-      iframe.remove();
+  ch.onmessage = e => {
+    if (e.data && e.data.access_token && !done) {
+      done = true;
+      ch.close();
+      S.token = e.data.access_token;
+      S.tokenExpiry = Date.now() + (e.data.expires_in || 3600) * 1000;
+      localStorage.setItem(LS_TOKEN,  S.token);
+      localStorage.setItem(LS_EXPIRY, S.tokenExpiry);
+      scheduleTokenRefresh();
+      document.getElementById('tokenDot').className = 'token-dot ok';
+      document.getElementById('tokenLabel').textContent = 'token renovado';
+      // Remove banner se estiver visível
+      document.getElementById('reloginBanner')?.remove();
     }
   };
 
-  // Timeout de segurança — se o iframe não responder em 10s
+  const popup = window.open(
+    'https://accounts.google.com/o/oauth2/v2/auth?' + params,
+    'oauth_refresh',
+    'width=1,height=1,top=-100,left=-100'
+  );
+
+  // Timeout — se não receber token em 8s, sessão realmente expirou
   setTimeout(() => {
-    if (document.getElementById('oauth_refresh_frame')) {
-      iframe.remove();
+    if (!done) {
+      done = true;
+      ch.close();
+      try { popup && popup.close(); } catch(_) {}
       handleTokenExpired();
     }
-  }, 10000);
+  }, 8000);
 }
 
 function handleTokenExpired() {
@@ -599,6 +593,23 @@ window.onload = async () => {
 
   // Verifica callback OAuth — token vem no hash da URL
   if (location.hash && location.hash.includes('access_token')) {
+    const hash = new URLSearchParams(location.hash.slice(1));
+    const state = new URLSearchParams(location.search).get('state');
+
+    // Se state=refresh é renovação silenciosa — envia token para a janela principal e fecha
+    if (state === 'refresh') {
+      const ch = new BroadcastChannel('sdm_token_refresh');
+      ch.postMessage({
+        access_token: hash.get('access_token'),
+        expires_in:   parseInt(hash.get('expires_in') || '3600'),
+      });
+      ch.close();
+      // Fecha o popup após enviar
+      setTimeout(() => window.close(), 500);
+      return;
+    }
+
+    // Login normal
     const ok = handleCallback();
     if (!ok) { toast('Erro no login', 'er'); return; }
   } else if (!loadSavedToken()) {
