@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 :root {
   --bg:#0e0f11;--bg2:#16181c;--bg3:#1e2128;
@@ -391,7 +392,6 @@ const SHEETS_API  = 'https://sheets.googleapis.com/v4/spreadsheets';
 const CHUNK       = 5 * 1024 * 1024;
 const MAX_CONC    = 2;
 const MAX_DL      = 3;
-const TOKEN_TTL   = 55 * 60 * 1000;
 const LS_TOKEN    = 'sdm_token';
 const LS_EXPIRY   = 'sdm_expiry';
 const LS_SESS     = 'sdm_sessions';
@@ -420,35 +420,50 @@ const S = {
 };
 
 // ════════════════════════════════════════════════════════════
-// OAUTH — fluxo implícito (token direto na URL hash)
-// Ideal para apps JavaScript puros sem backend
+// OAUTH — Google Identity Services (GIS)
+// Renovação automática silenciosa sem redirect
 // ════════════════════════════════════════════════════════════
-function startAuth() {
-  const params = new URLSearchParams({
-    client_id:     CLIENT_ID,
-    redirect_uri:  REDIRECT,
-    response_type: 'token',
-    scope:         SCOPES,
-    prompt:        'consent',
+let gisClient = null;
+
+function initGIS() {
+  gisClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope:     SCOPES,
+    // callback chamado ao obter/renovar token
+    callback: (resp) => {
+      if (resp.error) {
+        console.error('GIS error:', resp.error);
+        showReloginBanner();
+        return;
+      }
+      S.token      = resp.access_token;
+      S.tokenExpiry = Date.now() + (resp.expires_in || 3600) * 1000;
+      localStorage.setItem(LS_TOKEN,  S.token);
+      localStorage.setItem(LS_EXPIRY, S.tokenExpiry);
+      scheduleTokenRefresh();
+      document.getElementById('tokenDot').className  = 'token-dot ok';
+      document.getElementById('tokenLabel').textContent = 'ok';
+      document.getElementById('reloginBanner')?.remove();
+      // Se app ainda não carregou, carrega agora
+      if (document.getElementById('appScreen').style.display === 'none') {
+        showApp();
+      }
+    },
+    error_callback: (err) => {
+      if (err.type !== 'popup_closed') showReloginBanner();
+    },
   });
-  location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + params;
 }
 
-function handleCallback() {
-  // Token retorna no hash da URL: #access_token=...&expires_in=...
-  const hash = new URLSearchParams(location.hash.slice(1));
-  const token = hash.get('access_token');
-  const expiresIn = parseInt(hash.get('expires_in') || '3600');
-  if (token) {
-    S.token = token;
-    S.tokenExpiry = Date.now() + expiresIn * 1000;
-    localStorage.setItem(LS_TOKEN,  S.token);
-    localStorage.setItem(LS_EXPIRY, S.tokenExpiry);
-    // Limpa hash da URL — token não fica exposto
-    history.replaceState(null, '', REDIRECT);
-    return true;
-  }
-  return false;
+function startAuth() {
+  if (!gisClient) { toast('Aguarde...', 'in'); return; }
+  gisClient.requestAccessToken({ prompt: 'consent' });
+}
+
+function refreshToken() {
+  if (!gisClient) return;
+  // prompt='' → renovação silenciosa se o usuário já autorizou antes
+  gisClient.requestAccessToken({ prompt: '' });
 }
 
 function loadSavedToken() {
@@ -461,6 +476,7 @@ function loadSavedToken() {
 }
 
 function signOut() {
+  if (S.token) google.accounts.oauth2.revoke(S.token, () => {});
   localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_EXPIRY);
   S.token = null; S.tokenExpiry = 0;
   document.getElementById('appScreen').style.display = 'none';
@@ -472,80 +488,23 @@ function signOut() {
 // ════════════════════════════════════════════════════════════
 function scheduleTokenRefresh() {
   clearTimeout(S.tokenRefreshTimer); clearInterval(S.tokenCountdownTimer);
-  const delay = Math.max(S.tokenExpiry - Date.now() - 5*60*1000, 30000);
+  // Renova 5 min antes de expirar
+  const delay = Math.max(S.tokenExpiry - Date.now() - 5 * 60 * 1000, 30000);
   S.tokenRefreshTimer = setTimeout(refreshToken, delay);
   S.tokenCountdownTimer = setInterval(() => {
     const rem  = Math.max(0, S.tokenExpiry - Date.now());
-    const mins = Math.floor(rem/60000);
+    const mins = Math.floor(rem / 60000);
     const dot  = document.getElementById('tokenDot');
     const lbl  = document.getElementById('tokenLabel');
-    if (rem === 0)           { dot.className='token-dot exp'; lbl.textContent='expirado'; }
-    else if (rem < 5*60*1000){ dot.className='token-dot warn'; lbl.textContent=`expira ${mins}m`; }
-    else                     { dot.className='token-dot ok'; lbl.textContent=`ok · ${mins}m`; }
+    if (rem === 0)            { dot.className = 'token-dot exp'; lbl.textContent = 'expirado'; }
+    else if (rem < 5 * 60000) { dot.className = 'token-dot warn'; lbl.textContent = `expira ${mins}m`; }
+    else                      { dot.className = 'token-dot ok';   lbl.textContent = `ok · ${mins}m`; }
   }, 15000);
 }
 
-function refreshToken() {
-  document.getElementById('tokenDot').className = 'token-dot warn';
-  document.getElementById('tokenLabel').textContent = 'renovando...';
-
-  // Estratégia: abre popup minúsculo com prompt=none
-  // O popup redireciona de volta para o app com o novo token no hash
-  // A página principal escuta via BroadcastChannel
-  const params = new URLSearchParams({
-    client_id:     CLIENT_ID,
-    redirect_uri:  REDIRECT,
-    response_type: 'token',
-    scope:         SCOPES,
-    prompt:        'none',
-    state:         'refresh', // identifica que é renovação
-  });
-
-  // BroadcastChannel escuta o token que a página de retorno vai enviar
-  const ch = new BroadcastChannel('sdm_token_refresh');
-  let done = false;
-
-  ch.onmessage = e => {
-    if (e.data && e.data.access_token && !done) {
-      done = true;
-      ch.close();
-      S.token = e.data.access_token;
-      S.tokenExpiry = Date.now() + (e.data.expires_in || 3600) * 1000;
-      localStorage.setItem(LS_TOKEN,  S.token);
-      localStorage.setItem(LS_EXPIRY, S.tokenExpiry);
-      scheduleTokenRefresh();
-      document.getElementById('tokenDot').className = 'token-dot ok';
-      document.getElementById('tokenLabel').textContent = 'token renovado';
-      // Remove banner se estiver visível
-      document.getElementById('reloginBanner')?.remove();
-    }
-  };
-
-  const popup = window.open(
-    'https://accounts.google.com/o/oauth2/v2/auth?' + params,
-    'oauth_refresh',
-    'width=1,height=1,top=-100,left=-100'
-  );
-
-  // Timeout — se não receber token em 8s, sessão realmente expirou
-  setTimeout(() => {
-    if (!done) {
-      done = true;
-      ch.close();
-      try { popup && popup.close(); } catch(_) {}
-      handleTokenExpired();
-    }
-  }, 8000);
-}
-
-function handleTokenExpired() {
+function showReloginBanner() {
   document.getElementById('tokenDot').className = 'token-dot exp';
   document.getElementById('tokenLabel').textContent = 'sessão expirada';
-  // Mostra banner de relogin sem interromper o que o usuário está fazendo
-  showReloginBanner();
-}
-
-function showReloginBanner() {
   if (document.getElementById('reloginBanner')) return;
   const banner = document.createElement('div');
   banner.id = 'reloginBanner';
@@ -557,8 +516,8 @@ function showReloginBanner() {
   `;
   banner.innerHTML = `
     <i class="fa-solid fa-triangle-exclamation" style="color:var(--amber)"></i>
-    <span>Sessão expirada — faça login novamente para continuar</span>
-    <button onclick="startAuth()" style="padding:5px 14px;border-radius:var(--r);border:none;background:var(--accent);color:#fff;cursor:pointer;font-size:12px;font-family:var(--sans)">Renovar</button>
+    <span>Sessão expirada — clique para renovar</span>
+    <button onclick="refreshToken();this.parentElement.remove()" style="padding:5px 14px;border-radius:var(--r);border:none;background:var(--accent);color:#fff;cursor:pointer;font-size:12px;font-family:var(--sans)">Renovar</button>
     <button onclick="this.parentElement.remove()" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px">✕</button>
   `;
   document.body.appendChild(banner);
@@ -566,63 +525,44 @@ function showReloginBanner() {
 
 async function ensureToken() {
   if (S.tokenExpiry - Date.now() < 60000) {
-    // Tenta renovar antes de falhar
-    await new Promise(resolve => {
-      const check = setInterval(() => {
-        if (S.tokenExpiry - Date.now() > 60000) {
-          clearInterval(check); resolve();
-        }
-      }, 500);
-      // Se não renovar em 8s, desiste
-      setTimeout(() => { clearInterval(check); resolve(); }, 8000);
-    });
-    // Verifica novamente após tentativa de renovação
-    if (S.tokenExpiry - Date.now() < 60000) {
-      showReloginBanner();
-      throw new Error('Token expirado');
-    }
+    showReloginBanner();
+    throw new Error('Token expirado — renove a sessão');
   }
 }
 
 // ════════════════════════════════════════════════════════════
 // INIT
 // ════════════════════════════════════════════════════════════
-window.onload = async () => {
-  try { S.transferLog = JSON.parse(localStorage.getItem(LS_LOG)||'[]'); } catch(_) {}
-  S.logSheetId = localStorage.getItem(LS_SHEET) || null;
-
-  // Verifica callback OAuth — token vem no hash da URL
-  if (location.hash && location.hash.includes('access_token')) {
-    const hash = new URLSearchParams(location.hash.slice(1));
-    const state = new URLSearchParams(location.search).get('state');
-
-    // Se state=refresh é renovação silenciosa — envia token para a janela principal e fecha
-    if (state === 'refresh') {
-      const ch = new BroadcastChannel('sdm_token_refresh');
-      ch.postMessage({
-        access_token: hash.get('access_token'),
-        expires_in:   parseInt(hash.get('expires_in') || '3600'),
-      });
-      ch.close();
-      // Fecha o popup após enviar
-      setTimeout(() => window.close(), 500);
-      return;
-    }
-
-    // Login normal
-    const ok = handleCallback();
-    if (!ok) { toast('Erro no login', 'er'); return; }
-  } else if (!loadSavedToken()) {
-    return; // Mostra tela de auth
-  }
-
-  // Carrega app
+async function showApp() {
   document.getElementById('authScreen').style.display = 'none';
   document.getElementById('appScreen').style.display = 'flex';
   scheduleTokenRefresh();
   loadUserInfo();
   await loadSharedDrivesSidebar();
   await goMyDrive();
+}
+
+window.onload = async () => {
+  try { S.transferLog = JSON.parse(localStorage.getItem(LS_LOG)||'[]'); } catch(_) {}
+  S.logSheetId = localStorage.getItem(LS_SHEET) || null;
+
+  // Inicializa GIS assim que a biblioteca carregar
+  // google.accounts pode não estar disponível imediatamente
+  const waitGIS = () => new Promise(resolve => {
+    if (window.google?.accounts?.oauth2) return resolve();
+    const t = setInterval(() => {
+      if (window.google?.accounts?.oauth2) { clearInterval(t); resolve(); }
+    }, 100);
+    setTimeout(() => { clearInterval(t); resolve(); }, 5000);
+  });
+  await waitGIS();
+  initGIS();
+
+  // Verifica se há token salvo válido
+  if (loadSavedToken()) {
+    await showApp();
+  }
+  // Caso contrário mostra tela de login — GIS cuida do resto via startAuth()
 };
 
 async function loadUserInfo() {
@@ -712,13 +652,35 @@ async function jumpBc(idx) {
 async function loadFolder(folderId,driveId) {
   S.selected.clear(); updateSel(); showLoad();
   try {
-    const params={pageSize:200,orderBy:'folder,name',fields:'files(id,name,mimeType,size,modifiedTime,parents)',q:`'${folderId}' in parents and trashed=false`};
-    if (driveId){params.corpora='drive';params.driveId=driveId;params.includeItemsFromAllDrives=true;params.supportsAllDrives=true;}
-    const r=await driveApi('/files',params);
+    const baseParams = {
+      pageSize: 1000,
+      orderBy: 'folder,name',
+      fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,parents)',
+      q: `'${folderId}' in parents and trashed=false`,
+    };
+    if (driveId) {
+      baseParams.corpora = 'drive';
+      baseParams.driveId = driveId;
+      baseParams.includeItemsFromAllDrives = true;
+      baseParams.supportsAllDrives = true;
+    }
+    // Pagina até buscar todos os itens
+    let allFiles = [];
+    let pageToken = null;
+    do {
+      const params = { ...baseParams };
+      if (pageToken) params.pageToken = pageToken;
+      const r = await driveApi('/files', params);
+      allFiles = allFiles.concat(r.files || []);
+      pageToken = r.nextPageToken || null;
+    } while (pageToken);
+
     hideLoad();
-    S.files=(r.files||[]).map(formatFile); S.allFiles=S.files;
-    renderFiles(S.files); setStatus(S.files.length+' itens');
-  } catch(e){hideLoad();toast(e.message,'er');}
+    S.files = allFiles.map(formatFile);
+    S.allFiles = S.files;
+    renderFiles(S.files);
+    setStatus(S.files.length + ' itens');
+  } catch(e) { hideLoad(); toast(e.message, 'er'); }
 }
 
 async function loadSharedDrivesSidebar() {
@@ -1084,34 +1046,40 @@ async function downloadFileToDir(f, rootDir) {
 async function listFolderRecursive(folderId, basePath) {
   const results = [];
   await ensureToken();
-  const url = new URL(API + '/files');
-  url.searchParams.set('pageSize', '200');
-  url.searchParams.set('fields', 'files(id,name,mimeType,size)');
-  url.searchParams.set('q', `'${folderId}' in parents and trashed=false`);
-  url.searchParams.set('orderBy', 'folder,name');
-  if (S.currentDrive) {
-    url.searchParams.set('corpora', 'drive');
-    url.searchParams.set('driveId', S.currentDrive);
-    url.searchParams.set('includeItemsFromAllDrives', 'true');
-    url.searchParams.set('supportsAllDrives', 'true');
-  }
-  const res  = await fetch(url.toString(), { headers: { Authorization: 'Bearer ' + S.token } });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  const data = await res.json();
-  for (const f of (data.files || [])) {
-    if (f.mimeType === 'application/vnd.google-apps.folder') {
-      const sub = await listFolderRecursive(f.id, basePath ? basePath + '/' + f.name : f.name);
-      results.push(...sub);
-    } else {
-      results.push({
-        id:        f.id,
-        name:      f.name,
-        path:      basePath ? basePath + '/' + f.name : f.name,
-        sizeBytes: parseInt(f.size || 0),
-        mimeType:  f.mimeType,
-      });
+  // Pagina até buscar todos os itens da pasta
+  let pageToken = null;
+  do {
+    const url = new URL(API + '/files');
+    url.searchParams.set('pageSize', '1000');
+    url.searchParams.set('fields', 'nextPageToken,files(id,name,mimeType,size)');
+    url.searchParams.set('q', `'${folderId}' in parents and trashed=false`);
+    url.searchParams.set('orderBy', 'folder,name');
+    if (pageToken) url.searchParams.set('pageToken', pageToken);
+    if (S.currentDrive) {
+      url.searchParams.set('corpora', 'drive');
+      url.searchParams.set('driveId', S.currentDrive);
+      url.searchParams.set('includeItemsFromAllDrives', 'true');
+      url.searchParams.set('supportsAllDrives', 'true');
     }
-  }
+    const res  = await fetch(url.toString(), { headers: { Authorization: 'Bearer ' + S.token } });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    pageToken = data.nextPageToken || null;
+    for (const f of (data.files || [])) {
+      if (f.mimeType === 'application/vnd.google-apps.folder') {
+        const sub = await listFolderRecursive(f.id, basePath ? basePath + '/' + f.name : f.name);
+        results.push(...sub);
+      } else {
+        results.push({
+          id:        f.id,
+          name:      f.name,
+          path:      basePath ? basePath + '/' + f.name : f.name,
+          sizeBytes: parseInt(f.size || 0),
+          mimeType:  f.mimeType,
+        });
+      }
+    }
+  } while (pageToken);
   return results;
 }
 
