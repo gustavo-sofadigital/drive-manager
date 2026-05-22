@@ -602,15 +602,28 @@ async function goMyDrive() {
   await loadFolder('root',null);
 }
 
+async function listAllDrives() {
+  const drives = [];
+  let pageToken = null;
+  do {
+    const params = { pageSize: 100, fields: 'nextPageToken,drives(id,name)' };
+    if (pageToken) params.pageToken = pageToken;
+    const r = await driveApi('/drives', params);
+    drives.push(...(r.drives || []));
+    pageToken = r.nextPageToken || null;
+  } while (pageToken);
+  return drives;
+}
+
 async function goSharedDrives() {
   setActiveNav('nav-sh'); S.history=[];
   S.currentDrive=null; S.currentFolder=null; S.currentFolderName='Shared Drives';
   S.bcStack=[{id:null,name:'Shared Drives'}]; renderBc();
   showLoad('Carregando Shared Drives...');
   try {
-    const r = await driveApi('/drives',{pageSize:50,fields:'drives(id,name)'});
+    const drives = await listAllDrives();
     hideLoad();
-    S.files=(r.drives||[]).map(d=>({id:d.id,name:d.name,isDrive:true,type:'drive',size:'—',modified:'—',isFolder:false,mimeType:'',sizeBytes:0}));
+    S.files = drives.map(d=>({id:d.id,name:d.name,isDrive:true,type:'drive',size:'—',modified:'—',isFolder:false,mimeType:'',sizeBytes:0}));
     S.allFiles=S.files; renderFiles(S.files); setStatus(S.files.length+' shared drives');
   } catch(e){hideLoad();toast(e.message,'er');}
 }
@@ -685,10 +698,9 @@ async function loadFolder(folderId,driveId) {
 
 async function loadSharedDrivesSidebar() {
   try {
-    const r=await driveApi('/drives',{pageSize:50,fields:'drives(id,name)'});
+    const drives = await listAllDrives();
     const el=document.getElementById('drivesList');
-    const drives=r.drives||[];
-    el.innerHTML=drives.length?drives.map(d=>`<div class="drive-item" data-id="${d.id}" onclick="openSharedDrive('${d.id}','${esc(d.name)}')"><i class="fa-solid fa-hard-drive" style="color:var(--accent)"></i><span class="drive-name">${d.name}</span></div>`).join(''):'<div style="padding:6px 10px;font-size:11px;color:var(--text3);font-family:var(--mono)">Nenhum</div>';
+    el.innerHTML=drives.length?drives.map(d=>`<div class="drive-item" data-id="${d.id}" onclick="openSharedDrive('${esc(d.id)}','${esc(d.name)}')"><i class="fa-solid fa-hard-drive" style="color:var(--accent)"></i><span class="drive-name">${d.name}</span></div>`).join(''):'<div style="padding:6px 10px;font-size:11px;color:var(--text3);font-family:var(--mono)">Nenhum</div>';
   } catch(_){}
 }
 
